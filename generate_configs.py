@@ -382,14 +382,17 @@ async def _speed_test(cfg: Config, port: int) -> Optional[float]:
             stdout, _ = await asyncio.wait_for(curl.communicate(),
                                                timeout=SPEED_TEST_SECS + 6)
         except asyncio.TimeoutError:
-            curl.kill(); return None
+            try: curl.kill()
+            except ProcessLookupError: pass
+            return None
         mbps = float(stdout.decode().strip() or '0') * 8 / 1_000_000
         return round(mbps, 1) if mbps >= MIN_SPEED_MBPS else None
     except Exception as e:
         log.debug('speed port=%d: %s', port, e); return None
     finally:
         if proc:
-            proc.kill()
+            try: proc.kill()
+            except ProcessLookupError: pass
             try: await asyncio.wait_for(proc.wait(), timeout=2)
             except Exception: pass
         try: os.unlink(cfg_path)
