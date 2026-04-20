@@ -17,6 +17,11 @@ jobs:
           python-version: '3.x'
       - name: Install dependencies
         run: pip install aiohttp
+      - name: Install xray-core
+        run: |
+          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q Xray-linux-64.zip xray
+          chmod +x xray && sudo mv xray /usr/local/bin/xray
       - name: Generate configs.txt
         run: python generate_configs.py
       - name: Commit and push if changed
