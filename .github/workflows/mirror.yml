@@ -3,7 +3,7 @@ name: WhiteJ
 on:
   schedule:
     - cron: '0 * * * *' # Runs every hour
-  workflow_dispatch: # Hand Start
+  workflow_dispatch: # Hand start
 
 jobs:
   mirror:
@@ -21,12 +21,12 @@ jobs:
         run: pip install requests
 
       - name: Generate configs.txt
-        run: python generate_configs.py > configs.txt
+        run: python generate_configs.py
 
       - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add configs.txt
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update sub $(date +'%Y-%m-%d %H:%M:%S')"
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto update sub from $(date +'%Y-%m-%d %H:%M:%S')"
           git push
