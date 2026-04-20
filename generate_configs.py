@@ -1,27 +1,40 @@
 #!/usr/bin/env python3
 """
-Config Aggregator v2
-Collect → Parse → Dedup → TCP-test → Score → Export
+Relay Config Aggregator v3
+Pipeline: Fetch → Parse → Dedup → Static Score → TCP Probe → TLS Timing → Export
+
+Timing budget on 37k unique configs:
+  Stage 1 (fetch+parse):  ~5s
+  Stage 2 (TCP probe):   ~15s  (top 3000 pre-filtered, 300 concurrency, 1.5s timeout)
+  Stage 3 (TLS timing):  ~10s  (TLS/Reality nodes only, 200 concurrency, 3s timeout)
+  Total:                 ~30-40s
 """
 
 import asyncio
 import aiohttp
+import ssl
 import re
 import base64
 import json
 import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-TARGET_COUNT   = 100
-FETCH_TIMEOUT  = 10      # sec, per source
-TCP_TIMEOUT    = 3       # sec, per endpoint
-MAX_FETCH_CONC = 40      # parallel source fetches
-MAX_TEST_CONC  = 80      # parallel TCP probes
+TARGET_COUNT    = 100    # configs in final output
+PRE_FILTER_TOP  = 3000   # static-score top N before any network test
+                         # keeps TCP phase at ~15s instead of 23 minutes
+
+FETCH_TIMEOUT   = 10     # sec, per source HTTP request
+TCP_TIMEOUT     = 1.5    # sec, TCP connect probe
+TLS_TIMEOUT     = 3.0    # sec, TLS handshake probe
+
+MAX_FETCH_CONC  = 40     # parallel source fetches
+MAX_TCP_CONC    = 300    # parallel TCP probes
+MAX_TLS_CONC    = 200    # parallel TLS handshake probes
 
 SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt",
@@ -91,7 +104,6 @@ SOURCES = [
       for i in range(1, 21)],
 ]
 
-# SNI whitelisting: конфиги с такими доменами в SNI имеют split-routing приоритет
 WHITELIST_DOMAINS = [
     'gosuslugi.ru', 'mos.ru', 'nalog.ru', 'kremlin.ru', 'government.ru',
     'sberbank.ru', 'tbank.ru', 'alfabank.ru', 'vtb.ru', 'vk.com', 'ok.ru',
@@ -110,10 +122,9 @@ _TLD_MAP = {
     '.ee': ('🇪🇪', 'EE'),       '.jp': ('🇯🇵', 'Japan'),    '.sg': ('🇸🇬', 'SG'),
     '.hk': ('🇭🇰', 'HK'),       '.tw': ('🇹🇼', 'Taiwan'),   '.ro': ('🇷🇴', 'Romania'),
     '.hu': ('🇭🇺', 'Hungary'),  '.sk': ('🇸🇰', 'SK'),        '.bg': ('🇧🇬', 'BG'),
-    '.rs': ('🇷🇸', 'Serbia'),   '.md': ('🇲🇩', 'Moldova'),  '.mk': ('🇲🇰', 'MK'),
-    '.si': ('🇸🇮', 'Slovenia'), '.hr': ('🇭🇷', 'Croatia'),  '.ba': ('🇧🇦', 'BA'),
-    '.ca': ('🇨🇦', 'Canada'),   '.au': ('🇦🇺', 'AU'),        '.br': ('🇧🇷', 'Brazil'),
-    '.cn': ('🇨🇳', 'China'),    '.kr': ('🇰🇷', 'Korea'),    '.in': ('🇮🇳', 'India'),
+    '.rs': ('🇷🇸', 'Serbia'),   '.md': ('🇲🇩', 'Moldova'),  '.ca': ('🇨🇦', 'Canada'),
+    '.au': ('🇦🇺', 'AU'),        '.br': ('🇧🇷', 'Brazil'),   '.cn': ('🇨🇳', 'China'),
+    '.kr': ('🇰🇷', 'Korea'),    '.in': ('🇮🇳', 'India'),     '.si': ('🇸🇮', 'SI'),
 }
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
@@ -123,7 +134,7 @@ logging.basicConfig(
     format='%(asctime)s  %(levelname)-7s %(message)s',
     datefmt='%H:%M:%S',
 )
-log = logging.getLogger('Aggregator')
+log = logging.getLogger('relay')
 
 # ── DATA MODEL ────────────────────────────────────────────────────────────────
 
@@ -132,39 +143,49 @@ class Config:
     protocol: str
     host:     str
     port:     int
-    uid:      str          # uuid / password / key prefix
-    raw:      str          # URI без fragment
+    uid:      str
+    raw:      str
     sni:      str  = ''
     security: str  = ''
     network:  str  = ''
-    latency:  Optional[float] = None
+    # network probes — populated in stages 2-3
+    tcp_ms:   Optional[float] = None   # None = dead / untested
+    tls_ms:   Optional[float] = None   # None = not TLS or failed
 
     def key(self) -> str:
-        """Канонический ключ для дедупликации."""
         return f"{self.protocol}|{self.host.lower()}|{self.port}|{self.uid[:12]}"
 
     @property
-    def score(self) -> int:
+    def static_score(self) -> int:
+        """Score without network data — used for pre-filtering."""
         s = 0
         sec = self.security.lower()
-        if sec == 'reality':  s += 50
-        elif sec == 'tls':    s += 25
+        if sec == 'reality': s += 50
+        elif sec == 'tls':   s += 25
         if self.sni and any(d in self.sni for d in WHITELIST_DOMAINS):
             s += 30
-        if self.latency is not None:
-            # 0 ms → +30, 3000 ms → 0, линейно
-            s += max(0, 30 - int(self.latency / 100))
+        return s
+
+    @property
+    def score(self) -> int:
+        """Full score including network probes."""
+        s = self.static_score
+        # TCP latency: 0ms → +25, 1500ms → 0
+        if self.tcp_ms is not None:
+            s += max(0, 25 - int(self.tcp_ms / 60))
+        # TLS handshake: bonus for low-latency TLS/Reality
+        # 0ms → +20, 3000ms → 0
+        if self.tls_ms is not None:
+            s += max(0, 20 - int(self.tls_ms / 150))
         return s
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def _b64dec(s: str) -> Optional[str]:
-    """Декодирует base64 строку. Возвращает None при неудаче."""
     try:
         s = s.strip()
         pad = (-len(s)) % 4
-        decoded = base64.b64decode(s + '=' * pad)
-        return decoded.decode('utf-8', errors='replace')
+        return base64.b64decode(s + '=' * pad).decode('utf-8', errors='replace')
     except Exception:
         return None
 
@@ -175,268 +196,236 @@ def _country(host: str) -> tuple[str, str]:
             return pair
     return '🌐', 'Unknown'
 
-# ── PROTOCOL PARSERS ──────────────────────────────────────────────────────────
+# ── PARSERS ───────────────────────────────────────────────────────────────────
 
 def _parse_vless(raw: str) -> Optional[Config]:
     try:
-        p  = urlparse(raw)
-        qs = parse_qs(p.query)
-        host = p.hostname or ''
-        port = p.port or 443
-        if not host or not port:
-            return None
-        return Config(
-            protocol='vless',
-            host=host, port=port,
-            uid=p.username or '',
-            raw=raw,
-            sni=qs.get('sni', [''])[0],
-            security=qs.get('security', [''])[0].lower(),
-            network=qs.get('type', [''])[0].lower(),
-        )
-    except Exception:
-        return None
+        p = urlparse(raw); qs = parse_qs(p.query)
+        host = p.hostname or ''; port = p.port or 443
+        if not host: return None
+        return Config('vless', host, port, p.username or '', raw,
+                      sni=qs.get('sni', [''])[0],
+                      security=qs.get('security', [''])[0].lower(),
+                      network=qs.get('type', [''])[0].lower())
+    except Exception: return None
 
 def _parse_vmess(raw: str) -> Optional[Config]:
-    """vmess:// — тело это base64(JSON)."""
     try:
-        decoded = _b64dec(raw[8:])
-        if not decoded:
-            return None
-        d = json.loads(decoded)
-        host = str(d.get('add', '')).strip()
-        port = int(d.get('port', 443))
-        if not host or not port:
-            return None
-        sni = (d.get('sni') or d.get('host') or '').strip()
-        tls = 'tls' if str(d.get('tls', '')).lower() == 'tls' else ''
-        return Config(
-            protocol='vmess',
-            host=host, port=port,
-            uid=str(d.get('id', '')),
-            raw=raw,
-            sni=sni,
-            security=tls,
-            network=str(d.get('net', '')).lower(),
-        )
-    except Exception:
-        return None
+        d = json.loads(_b64dec(raw[8:]) or 'null')
+        if not d: return None
+        host = str(d.get('add', '')).strip(); port = int(d.get('port', 443))
+        if not host: return None
+        return Config('vmess', host, port, str(d.get('id', '')), raw,
+                      sni=(d.get('sni') or d.get('host') or '').strip(),
+                      security='tls' if str(d.get('tls', '')).lower() == 'tls' else '',
+                      network=str(d.get('net', '')).lower())
+    except Exception: return None
 
 def _parse_trojan(raw: str) -> Optional[Config]:
     try:
-        p  = urlparse(raw)
-        qs = parse_qs(p.query)
-        host = p.hostname or ''
-        port = p.port or 443
-        if not host:
-            return None
-        return Config(
-            protocol='trojan',
-            host=host, port=port,
-            uid=p.username or '',
-            raw=raw,
-            sni=qs.get('sni', [''])[0] or host,
-            security='tls',   # trojan всегда TLS
-            network=qs.get('type', [''])[0].lower(),
-        )
-    except Exception:
-        return None
+        p = urlparse(raw); qs = parse_qs(p.query)
+        host = p.hostname or ''; port = p.port or 443
+        if not host: return None
+        return Config('trojan', host, port, p.username or '', raw,
+                      sni=qs.get('sni', [''])[0] or host,
+                      security='tls',
+                      network=qs.get('type', [''])[0].lower())
+    except Exception: return None
 
 def _parse_ss(raw: str) -> Optional[Config]:
-    """
-    Два формата:
-      ss://BASE64(method:pass)@host:port
-      ss://BASE64(method:pass@host:port)
-    """
     try:
-        p = urlparse(raw)
-        qs = parse_qs(p.query)
+        p = urlparse(raw); qs = parse_qs(p.query)
         if p.hostname:
-            # Стандартный формат: userinfo = base64(method:pass)
-            host = p.hostname
-            port = p.port or 8388
-            uid  = p.username or ''
+            host, port, uid = p.hostname, p.port or 8388, p.username or ''
         else:
-            # Старый формат: вся netloc — base64
             decoded = _b64dec(p.netloc)
-            if not decoded:
-                return None
+            if not decoded: return None
             m = re.match(r'(.+)@([^:@]+):(\d+)$', decoded)
-            if not m:
-                return None
+            if not m: return None
             uid, host, port = m.group(1), m.group(2), int(m.group(3))
-        if not host:
-            return None
-        return Config(
-            protocol='ss',
-            host=host, port=port,
-            uid=uid[:20],
-            raw=raw,
-            sni=qs.get('sni', [''])[0],
-            security='none',
-            network=qs.get('type', [''])[0].lower(),
-        )
-    except Exception:
-        return None
+        if not host: return None
+        return Config('ss', host, port, uid[:20], raw,
+                      sni=qs.get('sni', [''])[0], security='none',
+                      network=qs.get('type', [''])[0].lower())
+    except Exception: return None
 
 _PARSERS: dict[str, callable] = {
-    'vless://':  _parse_vless,
-    'vmess://':  _parse_vmess,
-    'trojan://': _parse_trojan,
-    'ss://':     _parse_ss,
+    'vless://': _parse_vless, 'vmess://': _parse_vmess,
+    'trojan://': _parse_trojan, 'ss://': _parse_ss,
 }
+_PREFIXES = tuple(_PARSERS)
 
 def _parse_line(line: str) -> Optional[Config]:
-    uri = line.split('#')[0].strip()   # убираем fragment
+    uri = line.split('#')[0].strip()
     for prefix, fn in _PARSERS.items():
         if uri.startswith(prefix):
             return fn(uri)
     return None
 
-# ── SOURCE FETCHER ────────────────────────────────────────────────────────────
-
-_PROTO_PREFIXES = tuple(_PARSERS.keys())
+# ── FETCH ─────────────────────────────────────────────────────────────────────
 
 async def _fetch(session: aiohttp.ClientSession, url: str) -> list[str]:
     try:
-        async with session.get(
-            url, timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT),
-            ssl=False, allow_redirects=True,
-        ) as r:
-            if r.status != 200:
-                log.debug('HTTP %d  %s', r.status, url)
-                return []
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT),
+                               ssl=False, allow_redirects=True) as r:
+            if r.status != 200: return []
             text = (await r.text(errors='replace')).strip()
     except Exception as e:
-        log.debug('Fetch error  %s  %s', url, e)
+        log.debug('Fetch error %s: %s', url, e)
         return []
-
-    # Если в первых строках нет URI-схемы — пробуем base64
+    # Auto-detect base64 content
     sample = '\n'.join(text.splitlines()[:5])
-    if not any(p in sample for p in _PROTO_PREFIXES):
+    if not any(p in sample for p in _PREFIXES):
         decoded = _b64dec(text.replace('\n', '').replace('\r', ''))
-        if decoded and any(p in decoded for p in _PROTO_PREFIXES):
+        if decoded and any(p in decoded for p in _PREFIXES):
             text = decoded
+    return [l.split('#')[0] for l in text.splitlines()
+            if any(l.strip().startswith(p) for p in _PREFIXES)]
 
-    results = []
-    for line in text.splitlines():
-        line = line.strip()
-        if any(line.startswith(p) for p in _PROTO_PREFIXES):
-            results.append(line.split('#')[0])  # fragment уже здесь
-    return results
+# ── STAGE 2: TCP PROBE ────────────────────────────────────────────────────────
 
-# ── TCP PROBE ─────────────────────────────────────────────────────────────────
-
-async def _tcp_latency(host: str, port: int) -> Optional[float]:
-    try:
-        t0 = time.monotonic()
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=TCP_TIMEOUT
-        )
-        ms = (time.monotonic() - t0) * 1000
-        writer.close()
+async def _tcp_probe(cfg: Config, sem: asyncio.Semaphore) -> None:
+    async with sem:
         try:
-            await asyncio.wait_for(writer.wait_closed(), timeout=1)
+            t0 = time.monotonic()
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(cfg.host, cfg.port), timeout=TCP_TIMEOUT)
+            cfg.tcp_ms = round((time.monotonic() - t0) * 1000, 1)
+            writer.close()
+            try: await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+            except Exception: pass
         except Exception:
-            pass
-        return round(ms, 1)
-    except Exception:
-        return None
+            cfg.tcp_ms = None  # dead
+
+# ── STAGE 3: TLS HANDSHAKE TIMING ────────────────────────────────────────────
+#
+# Measures full TLS handshake time (TCP + crypto) for tls/reality nodes.
+# Reality presents a legit-looking cert for the SNI domain → handshake
+# completes normally with verify=False. Low TLS latency = low server load
+# + good uplink. Adds up to +20 pts to score.
+
+_TLS_CTX = ssl.create_default_context()
+_TLS_CTX.check_hostname = False
+_TLS_CTX.verify_mode = ssl.CERT_NONE
+
+async def _tls_probe(cfg: Config, sem: asyncio.Semaphore) -> None:
+    async with sem:
+        sni = cfg.sni or cfg.host
+        try:
+            t0 = time.monotonic()
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    cfg.host, cfg.port,
+                    ssl=_TLS_CTX,
+                    server_hostname=sni,
+                ),
+                timeout=TLS_TIMEOUT,
+            )
+            cfg.tls_ms = round((time.monotonic() - t0) * 1000, 1)
+            writer.close()
+            try: await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+            except Exception: pass
+        except Exception:
+            cfg.tls_ms = None
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
     t_start = time.monotonic()
-    log.info('Sources: %d', len(SOURCES))
 
-    # ── 1. Fetch all sources ──────────────────────────────────────────────────
-    connector = aiohttp.TCPConnector(limit=MAX_FETCH_CONC, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        raw_batches = await asyncio.gather(
-            *[_fetch(session, url) for url in SOURCES],
-            return_exceptions=False,
-        )
+    # ── 1. Fetch ──────────────────────────────────────────────────────────────
+    log.info('Stage 1 — Fetching %d sources...', len(SOURCES))
+    conn = aiohttp.TCPConnector(limit=MAX_FETCH_CONC, ssl=False)
+    async with aiohttp.ClientSession(connector=conn) as session:
+        batches = await asyncio.gather(*[_fetch(session, u) for u in SOURCES])
 
-    raw_lines = [line for batch in raw_batches for line in batch]
-    log.info('Raw lines collected: %d', len(raw_lines))
+    raw_lines = [l for b in batches for l in b]
+    log.info('  raw lines: %d', len(raw_lines))
 
     # ── 2. Parse + dedup ──────────────────────────────────────────────────────
     seen: dict[str, Config] = {}
-    invalid = 0
+    bad = 0
     for line in raw_lines:
         cfg = _parse_line(line)
-        if cfg is None or not cfg.host or not (1 <= cfg.port <= 65535):
-            invalid += 1
-            continue
+        if not cfg or not cfg.host or not (1 <= cfg.port <= 65535):
+            bad += 1; continue
         k = cfg.key()
         if k not in seen:
             seen[k] = cfg
 
     unique = list(seen.values())
-    log.info('Unique configs: %d  (invalid/dup discarded: %d)', len(unique), invalid)
+    log.info('  unique: %d  (dropped: %d)', len(unique), bad)
 
-    # ── 3. TCP latency test ───────────────────────────────────────────────────
-    log.info('TCP probing %d endpoints (timeout=%ds, concurrency=%d)...',
-             len(unique), TCP_TIMEOUT, MAX_TEST_CONC)
-    sem = asyncio.Semaphore(MAX_TEST_CONC)
+    # ── 3. Pre-filter by static score ─────────────────────────────────────────
+    # Sort by static score, test only top PRE_FILTER_TOP.
+    # Rationale: Reality/TLS/SNI-whitelisted configs are almost always better;
+    # testing all 37k would take 23 minutes.
+    unique.sort(key=lambda c: c.static_score, reverse=True)
+    candidates = unique[:PRE_FILTER_TOP]
+    skipped = len(unique) - len(candidates)
+    log.info('Stage 2 — TCP probe: testing top %d (skipping %d low-score)',
+             len(candidates), skipped)
 
-    async def _probe(cfg: Config) -> None:
-        async with sem:
-            cfg.latency = await _tcp_latency(cfg.host, cfg.port)
+    tcp_sem = asyncio.Semaphore(MAX_TCP_CONC)
+    await asyncio.gather(*[_tcp_probe(c, tcp_sem) for c in candidates])
 
-    await asyncio.gather(*[_probe(c) for c in unique])
+    alive = [c for c in candidates if c.tcp_ms is not None]
+    log.info('  alive: %d  dead: %d  (%.1fs)',
+             len(alive), len(candidates) - len(alive), time.monotonic() - t_start)
 
-    alive = [c for c in unique if c.latency is not None]
-    dead  = len(unique) - len(alive)
-    log.info('TCP alive: %d  dead: %d', len(alive), dead)
+    # ── 4. TLS handshake timing ───────────────────────────────────────────────
+    tls_candidates = [c for c in alive if c.security in ('tls', 'reality')]
+    log.info('Stage 3 — TLS timing: %d nodes', len(tls_candidates))
 
-    # ── 4. Score + sort + slice ───────────────────────────────────────────────
+    tls_sem = asyncio.Semaphore(MAX_TLS_CONC)
+    await asyncio.gather(*[_tls_probe(c, tls_sem) for c in tls_candidates])
+
+    tls_ok  = sum(1 for c in tls_candidates if c.tls_ms is not None)
+    tls_bad = len(tls_candidates) - tls_ok
+    log.info('  TLS ok: %d  failed: %d  (%.1fs)',
+             tls_ok, tls_bad, time.monotonic() - t_start)
+
+    # ── 5. Final sort + slice ─────────────────────────────────────────────────
     alive.sort(key=lambda c: c.score, reverse=True)
     final = alive[:TARGET_COUNT]
 
-    # ── 5. Build output ───────────────────────────────────────────────────────
+    # ── 6. Build output ───────────────────────────────────────────────────────
     ts = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())
-    header = [
-        '#profile-title: Aggregator 100',
+    lines = [
+        '#profile-title: Relay 100',
         '#profile-update-interval: 1',
-        f'#announce: ⚡️ Aggregator {len(final)} configs | {ts} ⚡️',
-        '#profile-web-page-url: https://github.com/jasonevm/aggregator',
+        f'#announce: ⚡️ Relay {len(final)} configs | {ts} ⚡️',
+        '#profile-web-page-url: https://github.com/jasonevm/relay',
         '',
     ]
-
-    body = []
     for i, cfg in enumerate(final):
         flag, ctry = _country(cfg.host)
-        proto  = cfg.protocol.upper()
         sec    = cfg.security.upper() or '—'
         sni    = cfg.sni or '—'
-        lat    = f'{cfg.latency:.0f}ms' if cfg.latency else '?'
-        name   = f'{flag} {ctry} | {proto} | {sec} | {sni} | {lat} | #{i+1}'
-        body.append(f'{cfg.raw}#{name}')
+        tcp    = f'{cfg.tcp_ms:.0f}ms' if cfg.tcp_ms else '?'
+        tls    = f'TLS:{cfg.tls_ms:.0f}ms' if cfg.tls_ms else ''
+        timing = f'{tcp} {tls}'.strip()
+        name   = f'{flag} {ctry} | {cfg.protocol.upper()} | {sec} | {sni} | {timing} | #{i+1}'
+        lines.append(f'{cfg.raw}#{name}')
 
-    out = 'configs.txt'
-    with open(out, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(header + body) + '\n')
+    with open('configs.txt', 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
 
-    # ── 6. Stats ──────────────────────────────────────────────────────────────
-    proto_cnt:   dict[str, int] = {}
-    sec_cnt:     dict[str, int] = {}
-    country_cnt: dict[str, int] = {}
-    for cfg in final:
-        proto_cnt[cfg.protocol]                  = proto_cnt.get(cfg.protocol, 0) + 1
-        sec_cnt[cfg.security or 'none']          = sec_cnt.get(cfg.security or 'none', 0) + 1
-        _, ctry = _country(cfg.host)
-        country_cnt[ctry]                        = country_cnt.get(ctry, 0) + 1
-
-    top5 = sorted(country_cnt.items(), key=lambda x: -x[1])[:5]
+    # ── 7. Stats ──────────────────────────────────────────────────────────────
     elapsed = time.monotonic() - t_start
+    by_proto = {}; by_sec = {}; by_ctry = {}
+    for c in final:
+        by_proto[c.protocol]       = by_proto.get(c.protocol, 0) + 1
+        by_sec[c.security or '—']  = by_sec.get(c.security or '—', 0) + 1
+        _, ctry = _country(c.host)
+        by_ctry[ctry]              = by_ctry.get(ctry, 0) + 1
 
-    log.info('─' * 50)
-    log.info('Saved → %s  (%d configs)', out, len(final))
-    log.info('Protocol : %s', proto_cnt)
-    log.info('Security : %s', sec_cnt)
-    log.info('Top countries: %s', top5)
-    log.info('Elapsed: %.1fs', elapsed)
+    log.info('─' * 52)
+    log.info('Saved configs.txt  (%d configs)', len(final))
+    log.info('Protocol : %s', by_proto)
+    log.info('Security : %s', by_sec)
+    log.info('Countries: %s', sorted(by_ctry.items(), key=lambda x: -x[1])[:5])
+    log.info('Total elapsed: %.1fs', elapsed)
 
 if __name__ == '__main__':
     asyncio.run(main())
