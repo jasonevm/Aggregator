@@ -117,10 +117,10 @@ def main():
     current_version = datetime.datetime.now().strftime("%Y%m%d.%H%M")
 
     header = [
-        "#profile-title: 🐱 CatWhiteVPN fork",
+        "#profile-title: WhiteJ",
         "#profile-update-interval: 2",
-        f"#announce: ⚡️ ФОРК, @catlergememe версия: {current_version} ⚡️",
-        "#profile-web-page-url: https://github.com/YOUR_USERNAME/YOUR_REPO_NAME", # Update this to your GitHub repo URL
+        f"#announce: ⚡️ WhiteJ version: {1} ⚡️",
+        "#profile-web-page-url: https://github.com/jasonevm/whitej",
         ""
     ]
     
