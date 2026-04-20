@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-Relay Config Aggregator v3
-Pipeline: Fetch → Parse → Dedup → Static Score → TCP Probe → TLS Timing → Export
+Relay Config Aggregator v4
+Fetch → Parse → Dedup → TCP (ALL) → Speed Test (top alive) → Export
 
-Timing budget on 37k unique configs:
-  Stage 1 (fetch+parse):  ~5s
-  Stage 2 (TCP probe):   ~15s  (top 3000 pre-filtered, 300 concurrency, 1.5s timeout)
-  Stage 3 (TLS timing):  ~10s  (TLS/Reality nodes only, 200 concurrency, 3s timeout)
-  Total:                 ~30-40s
+Timing on 37k unique configs (GitHub Actions, 2-core):
+  Fetch+parse:          ~5s
+  TCP probe (all 37k):  ~90s   (400 concurrency, 1.0s timeout)
+  Speed test (top 500): ~150s  (30 workers, 8s per node)
+  Total:                ~4 min
+
+Requires xray binary in PATH. Add to workflow:
+  wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+  unzip -q Xray-linux-64.zip xray && chmod +x xray && sudo mv xray /usr/local/bin/
 """
 
 import asyncio
 import aiohttp
-import ssl
 import re
-import base64
+import os
 import json
+import base64
 import time
 import logging
 from dataclasses import dataclass
@@ -24,17 +28,18 @@ from urllib.parse import urlparse, parse_qs
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-TARGET_COUNT    = 100    # configs in final output
-PRE_FILTER_TOP  = 3000   # static-score top N before any network test
-                         # keeps TCP phase at ~15s instead of 23 minutes
+TARGET_COUNT    = 100
+FETCH_TIMEOUT   = 10
+TCP_TIMEOUT     = 1.0
+MAX_FETCH_CONC  = 40
+MAX_TCP_CONC    = 400    # all 37k: 37k/400 * 1.0s ≈ 90s
 
-FETCH_TIMEOUT   = 10     # sec, per source HTTP request
-TCP_TIMEOUT     = 1.5    # sec, TCP connect probe
-TLS_TIMEOUT     = 3.0    # sec, TLS handshake probe
-
-MAX_FETCH_CONC  = 40     # parallel source fetches
-MAX_TCP_CONC    = 300    # parallel TCP probes
-MAX_TLS_CONC    = 200    # parallel TLS handshake probes
+SPEED_TEST_URL  = 'https://cachefly.cachefly.net/50mb.test'
+SPEED_TEST_SECS = 8
+MIN_SPEED_MBPS  = 50.0
+SPEED_TEST_TOP  = 500    # speed-test top N alive (by TCP latency)
+SPEED_WORKERS   = 30     # parallel xray+curl instances
+SPEED_PORT_BASE = 20000  # local SOCKS5 ports 20000–20029
 
 SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt",
@@ -66,7 +71,7 @@ SOURCES = [
     "https://raw.githubusercontent.com/Sanuyyq/sub-storage1/refs/heads/main/bs.txt",
     "https://gbr.mydan.online/configs",
     "https://raw.githubusercontent.com/Temnuk/naabuzil/refs/heads/main/Svoboda",
-    "https://raw.githubusercontent.com/ewecrow78-gif/whitelist1/main/list.txt",
+    "https://raw.githubusercontent.com/ewecross78-gif/whitelist1/main/list.txt",
     "https://ety.twinkvibe.gay/whitelist",
     "https://raw.githubusercontent.com/LimeHi/LimeVPN/refs/heads/main/LimeVPN.txt?v=1",
     "https://raw.githubusercontent.com/ShatakVPN/ConfigForge-V2Ray/main/configs/ru/vless.txt",
@@ -125,15 +130,21 @@ _TLD_MAP = {
     '.rs': ('🇷🇸', 'Serbia'),   '.md': ('🇲🇩', 'Moldova'),  '.ca': ('🇨🇦', 'Canada'),
     '.au': ('🇦🇺', 'AU'),        '.br': ('🇧🇷', 'Brazil'),   '.cn': ('🇨🇳', 'China'),
     '.kr': ('🇰🇷', 'Korea'),    '.in': ('🇮🇳', 'India'),     '.si': ('🇸🇮', 'SI'),
+    '.no': ('🇳🇴', 'Norway'),   '.dk': ('🇩🇰', 'Denmark'),  '.pt': ('🇵🇹', 'Portugal'),
+    '.es': ('🇪🇸', 'Spain'),    '.it': ('🇮🇹', 'Italy'),     '.gr': ('🇬🇷', 'Greece'),
 }
+
+_VIBES = [
+    '⚡', '🔥', '🌊', '🎯', '💎', '🚀', '🌟', '🎭', '🦁', '🐉',
+    '🦅', '🌈', '💫', '🏆', '🌙', '☄️', '🔮', '🛸', '⚔️', '🧬',
+    '🎲', '🌺', '🦊', '🐺', '🌠', '💥', '🧲', '🎪', '🧿', '🪐',
+]
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s  %(levelname)-7s %(message)s',
-    datefmt='%H:%M:%S',
-)
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s  %(levelname)-7s %(message)s',
+                    datefmt='%H:%M:%S')
 log = logging.getLogger('relay')
 
 # ── DATA MODEL ────────────────────────────────────────────────────────────────
@@ -145,49 +156,33 @@ class Config:
     port:     int
     uid:      str
     raw:      str
-    sni:      str  = ''
-    security: str  = ''
-    network:  str  = ''
-    # network probes — populated in stages 2-3
-    tcp_ms:   Optional[float] = None   # None = dead / untested
-    tls_ms:   Optional[float] = None   # None = not TLS or failed
+    sni:      str = ''
+    security: str = ''
+    network:  str = ''
+    pbk:      str = ''   # reality publicKey
+    sid:      str = ''   # reality shortId
+    fp:       str = ''   # fingerprint
+    flow:     str = ''   # xtls flow
+    path:     str = ''   # ws/grpc/h2 path
+    host_hdr: str = ''   # ws Host header
+    tcp_ms:     Optional[float] = None
+    speed_mbps: Optional[float] = None
 
     def key(self) -> str:
         return f"{self.protocol}|{self.host.lower()}|{self.port}|{self.uid[:12]}"
 
-    @property
-    def static_score(self) -> int:
-        """Score without network data — used for pre-filtering."""
-        s = 0
-        sec = self.security.lower()
-        if sec == 'reality': s += 50
-        elif sec == 'tls':   s += 25
-        if self.sni and any(d in self.sni for d in WHITELIST_DOMAINS):
-            s += 30
-        return s
-
-    @property
-    def score(self) -> int:
-        """Full score including network probes."""
-        s = self.static_score
-        # TCP latency: 0ms → +25, 1500ms → 0
-        if self.tcp_ms is not None:
-            s += max(0, 25 - int(self.tcp_ms / 60))
-        # TLS handshake: bonus for low-latency TLS/Reality
-        # 0ms → +20, 3000ms → 0
-        if self.tls_ms is not None:
-            s += max(0, 20 - int(self.tls_ms / 150))
-        return s
+    def label(self, idx: int) -> str:
+        flag, ctry = _country(self.host)
+        vibe = _VIBES[abs(hash(self.key())) % len(_VIBES)]
+        return f'{flag} {vibe} {ctry} #{idx + 1}'
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def _b64dec(s: str) -> Optional[str]:
     try:
-        s = s.strip()
-        pad = (-len(s)) % 4
+        s = s.strip(); pad = (-len(s)) % 4
         return base64.b64decode(s + '=' * pad).decode('utf-8', errors='replace')
-    except Exception:
-        return None
+    except Exception: return None
 
 def _country(host: str) -> tuple[str, str]:
     h = host.lower()
@@ -206,7 +201,13 @@ def _parse_vless(raw: str) -> Optional[Config]:
         return Config('vless', host, port, p.username or '', raw,
                       sni=qs.get('sni', [''])[0],
                       security=qs.get('security', [''])[0].lower(),
-                      network=qs.get('type', [''])[0].lower())
+                      network=qs.get('type', [''])[0].lower(),
+                      pbk=qs.get('pbk', [''])[0],
+                      sid=qs.get('sid', [''])[0],
+                      fp=qs.get('fp', ['chrome'])[0] or 'chrome',
+                      flow=qs.get('flow', [''])[0],
+                      path=qs.get('path', [''])[0],
+                      host_hdr=qs.get('host', [''])[0])
     except Exception: return None
 
 def _parse_vmess(raw: str) -> Optional[Config]:
@@ -218,7 +219,9 @@ def _parse_vmess(raw: str) -> Optional[Config]:
         return Config('vmess', host, port, str(d.get('id', '')), raw,
                       sni=(d.get('sni') or d.get('host') or '').strip(),
                       security='tls' if str(d.get('tls', '')).lower() == 'tls' else '',
-                      network=str(d.get('net', '')).lower())
+                      network=str(d.get('net', '')).lower(),
+                      path=str(d.get('path', '')),
+                      host_hdr=str(d.get('host', '')))
     except Exception: return None
 
 def _parse_trojan(raw: str) -> Optional[Config]:
@@ -228,8 +231,8 @@ def _parse_trojan(raw: str) -> Optional[Config]:
         if not host: return None
         return Config('trojan', host, port, p.username or '', raw,
                       sni=qs.get('sni', [''])[0] or host,
-                      security='tls',
-                      network=qs.get('type', [''])[0].lower())
+                      security='tls', network=qs.get('type', [''])[0].lower(),
+                      path=qs.get('path', [''])[0], fp=qs.get('fp', [''])[0])
     except Exception: return None
 
 def _parse_ss(raw: str) -> Optional[Config]:
@@ -244,7 +247,7 @@ def _parse_ss(raw: str) -> Optional[Config]:
             if not m: return None
             uid, host, port = m.group(1), m.group(2), int(m.group(3))
         if not host: return None
-        return Config('ss', host, port, uid[:20], raw,
+        return Config('ss', host, port, uid[:40], raw,
                       sni=qs.get('sni', [''])[0], security='none',
                       network=qs.get('type', [''])[0].lower())
     except Exception: return None
@@ -271,9 +274,7 @@ async def _fetch(session: aiohttp.ClientSession, url: str) -> list[str]:
             if r.status != 200: return []
             text = (await r.text(errors='replace')).strip()
     except Exception as e:
-        log.debug('Fetch error %s: %s', url, e)
-        return []
-    # Auto-detect base64 content
+        log.debug('fetch %s: %s', url, e); return []
     sample = '\n'.join(text.splitlines()[:5])
     if not any(p in sample for p in _PREFIXES):
         decoded = _b64dec(text.replace('\n', '').replace('\r', ''))
@@ -282,150 +283,211 @@ async def _fetch(session: aiohttp.ClientSession, url: str) -> list[str]:
     return [l.split('#')[0] for l in text.splitlines()
             if any(l.strip().startswith(p) for p in _PREFIXES)]
 
-# ── STAGE 2: TCP PROBE ────────────────────────────────────────────────────────
+# ── TCP PROBE ─────────────────────────────────────────────────────────────────
 
 async def _tcp_probe(cfg: Config, sem: asyncio.Semaphore) -> None:
     async with sem:
         try:
             t0 = time.monotonic()
-            _, writer = await asyncio.wait_for(
+            _, w = await asyncio.wait_for(
                 asyncio.open_connection(cfg.host, cfg.port), timeout=TCP_TIMEOUT)
             cfg.tcp_ms = round((time.monotonic() - t0) * 1000, 1)
-            writer.close()
-            try: await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+            w.close()
+            try: await asyncio.wait_for(w.wait_closed(), timeout=0.3)
             except Exception: pass
-        except Exception:
-            cfg.tcp_ms = None  # dead
+        except Exception: cfg.tcp_ms = None
 
-# ── STAGE 3: TLS HANDSHAKE TIMING ────────────────────────────────────────────
-#
-# Measures full TLS handshake time (TCP + crypto) for tls/reality nodes.
-# Reality presents a legit-looking cert for the SNI domain → handshake
-# completes normally with verify=False. Low TLS latency = low server load
-# + good uplink. Adds up to +20 pts to score.
+# ── XRAY CONFIG BUILDER ───────────────────────────────────────────────────────
 
-_TLS_CTX = ssl.create_default_context()
-_TLS_CTX.check_hostname = False
-_TLS_CTX.verify_mode = ssl.CERT_NONE
+def _stream_settings(cfg: Config) -> dict:
+    sec = cfg.security.lower(); net = cfg.network.lower() or 'tcp'
+    ss: dict = {'network': net}
+    if sec == 'reality':
+        ss['security'] = 'reality'
+        ss['realitySettings'] = {
+            'serverName': cfg.sni, 'fingerprint': cfg.fp or 'chrome',
+            'publicKey': cfg.pbk, 'shortId': cfg.sid,
+        }
+    elif sec == 'tls':
+        ss['security'] = 'tls'
+        ss['tlsSettings'] = {
+            'serverName': cfg.sni, 'allowInsecure': True,
+            'fingerprint': cfg.fp or '',
+        }
+    if net == 'ws':
+        ss['wsSettings'] = {
+            'path': cfg.path or '/',
+            'headers': {'Host': cfg.host_hdr or cfg.sni or cfg.host},
+        }
+    elif net == 'grpc':
+        ss['grpcSettings'] = {'serviceName': cfg.path or ''}
+    elif net in ('h2', 'http'):
+        ss['httpSettings'] = {
+            'host': [cfg.host_hdr or cfg.sni or cfg.host],
+            'path': cfg.path or '/',
+        }
+    return ss
 
-async def _tls_probe(cfg: Config, sem: asyncio.Semaphore) -> None:
-    async with sem:
-        sni = cfg.sni or cfg.host
+def _xray_config(cfg: Config, port: int) -> dict:
+    inbound = {'listen': '127.0.0.1', 'port': port, 'protocol': 'socks',
+               'settings': {'auth': 'noauth', 'udp': False}}
+    if cfg.protocol == 'vless':
+        out = {'protocol': 'vless',
+               'settings': {'vnext': [{'address': cfg.host, 'port': cfg.port,
+                   'users': [{'id': cfg.uid, 'encryption': 'none', 'flow': cfg.flow}]}]},
+               'streamSettings': _stream_settings(cfg)}
+    elif cfg.protocol == 'vmess':
+        out = {'protocol': 'vmess',
+               'settings': {'vnext': [{'address': cfg.host, 'port': cfg.port,
+                   'users': [{'id': cfg.uid, 'alterId': 0, 'security': 'auto'}]}]},
+               'streamSettings': _stream_settings(cfg)}
+    elif cfg.protocol == 'trojan':
+        out = {'protocol': 'trojan',
+               'settings': {'servers': [{'address': cfg.host, 'port': cfg.port,
+                   'password': cfg.uid}]},
+               'streamSettings': _stream_settings(cfg)}
+    elif cfg.protocol == 'ss':
+        method, password = (cfg.uid.split(':', 1) if ':' in cfg.uid
+                            else ('aes-256-gcm', cfg.uid))
+        out = {'protocol': 'shadowsocks',
+               'settings': {'servers': [{'address': cfg.host, 'port': cfg.port,
+                   'method': method, 'password': password}]}}
+    else:
+        raise ValueError(cfg.protocol)
+    return {'log': {'loglevel': 'none'}, 'inbounds': [inbound],
+            'outbounds': [out, {'protocol': 'freedom', 'tag': 'direct'}]}
+
+# ── SPEED TEST ────────────────────────────────────────────────────────────────
+
+async def _speed_test(cfg: Config, port: int) -> Optional[float]:
+    cfg_path = f'/tmp/relay_{port}.json'
+    proc = None
+    try:
+        with open(cfg_path, 'w') as f:
+            json.dump(_xray_config(cfg, port), f)
+        proc = await asyncio.create_subprocess_exec(
+            'xray', 'run', '-c', cfg_path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await asyncio.sleep(0.7)   # wait for xray SOCKS5 bind
+        curl = await asyncio.create_subprocess_exec(
+            'curl', '--silent',
+            '--proxy', f'socks5h://127.0.0.1:{port}',
+            '--max-time', str(SPEED_TEST_SECS),
+            '--connect-timeout', '3',
+            '--output', '/dev/null',
+            '--write-out', '%{speed_download}',
+            SPEED_TEST_URL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         try:
-            t0 = time.monotonic()
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    cfg.host, cfg.port,
-                    ssl=_TLS_CTX,
-                    server_hostname=sni,
-                ),
-                timeout=TLS_TIMEOUT,
-            )
-            cfg.tls_ms = round((time.monotonic() - t0) * 1000, 1)
-            writer.close()
-            try: await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+            stdout, _ = await asyncio.wait_for(curl.communicate(),
+                                               timeout=SPEED_TEST_SECS + 6)
+        except asyncio.TimeoutError:
+            curl.kill(); return None
+        mbps = float(stdout.decode().strip() or '0') * 8 / 1_000_000
+        return round(mbps, 1) if mbps >= MIN_SPEED_MBPS else None
+    except Exception as e:
+        log.debug('speed port=%d: %s', port, e); return None
+    finally:
+        if proc:
+            proc.kill()
+            try: await asyncio.wait_for(proc.wait(), timeout=2)
             except Exception: pass
-        except Exception:
-            cfg.tls_ms = None
+        try: os.unlink(cfg_path)
+        except Exception: pass
+
+async def _run_speed_tests(candidates: list[Config]) -> list[Config]:
+    port_q: asyncio.Queue[int] = asyncio.Queue()
+    for i in range(SPEED_WORKERS):
+        await port_q.put(SPEED_PORT_BASE + i)
+    done = 0; total = len(candidates)
+
+    async def worker(cfg: Config) -> None:
+        nonlocal done
+        port = await port_q.get()
+        try: cfg.speed_mbps = await _speed_test(cfg, port)
+        finally:
+            await port_q.put(port); done += 1
+            if done % 50 == 0 or done == total:
+                passed = sum(1 for c in candidates[:done] if c.speed_mbps)
+                log.info('  speed %d/%d  ≥%.0fMbps: %d', done, total, MIN_SPEED_MBPS, passed)
+
+    await asyncio.gather(*[worker(c) for c in candidates])
+    return [c for c in candidates if c.speed_mbps is not None]
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    t_start = time.monotonic()
+    t0 = time.monotonic()
 
-    # ── 1. Fetch ──────────────────────────────────────────────────────────────
-    log.info('Stage 1 — Fetching %d sources...', len(SOURCES))
+    log.info('Stage 1 — fetching %d sources', len(SOURCES))
     conn = aiohttp.TCPConnector(limit=MAX_FETCH_CONC, ssl=False)
     async with aiohttp.ClientSession(connector=conn) as session:
         batches = await asyncio.gather(*[_fetch(session, u) for u in SOURCES])
-
     raw_lines = [l for b in batches for l in b]
-    log.info('  raw lines: %d', len(raw_lines))
+    log.info('  raw: %d  (%.1fs)', len(raw_lines), time.monotonic() - t0)
 
-    # ── 2. Parse + dedup ──────────────────────────────────────────────────────
-    seen: dict[str, Config] = {}
-    bad = 0
+    seen: dict[str, Config] = {}; bad = 0
     for line in raw_lines:
         cfg = _parse_line(line)
-        if not cfg or not cfg.host or not (1 <= cfg.port <= 65535):
-            bad += 1; continue
+        if not cfg or not cfg.host or not (1 <= cfg.port <= 65535): bad += 1; continue
         k = cfg.key()
-        if k not in seen:
-            seen[k] = cfg
-
+        if k not in seen: seen[k] = cfg
     unique = list(seen.values())
-    log.info('  unique: %d  (dropped: %d)', len(unique), bad)
+    log.info('  unique: %d  dropped: %d  (%.1fs)', len(unique), bad, time.monotonic() - t0)
 
-    # ── 3. Pre-filter by static score ─────────────────────────────────────────
-    # Sort by static score, test only top PRE_FILTER_TOP.
-    # Rationale: Reality/TLS/SNI-whitelisted configs are almost always better;
-    # testing all 37k would take 23 minutes.
-    unique.sort(key=lambda c: c.static_score, reverse=True)
-    candidates = unique[:PRE_FILTER_TOP]
-    skipped = len(unique) - len(candidates)
-    log.info('Stage 2 — TCP probe: testing top %d (skipping %d low-score)',
-             len(candidates), skipped)
-
+    log.info('Stage 2 — TCP probe: all %d (conc=%d, timeout=%.1fs)',
+             len(unique), MAX_TCP_CONC, TCP_TIMEOUT)
     tcp_sem = asyncio.Semaphore(MAX_TCP_CONC)
-    await asyncio.gather(*[_tcp_probe(c, tcp_sem) for c in candidates])
-
-    alive = [c for c in candidates if c.tcp_ms is not None]
+    await asyncio.gather(*[_tcp_probe(c, tcp_sem) for c in unique])
+    alive = sorted([c for c in unique if c.tcp_ms is not None], key=lambda c: c.tcp_ms)
     log.info('  alive: %d  dead: %d  (%.1fs)',
-             len(alive), len(candidates) - len(alive), time.monotonic() - t_start)
+             len(alive), len(unique) - len(alive), time.monotonic() - t0)
 
-    # ── 4. TLS handshake timing ───────────────────────────────────────────────
-    tls_candidates = [c for c in alive if c.security in ('tls', 'reality')]
-    log.info('Stage 3 — TLS timing: %d nodes', len(tls_candidates))
+    candidates = alive[:SPEED_TEST_TOP]
+    log.info('Stage 3 — speed test: top %d (workers=%d, max=%.0fMbps, min=%.0fMbps)',
+             len(candidates), SPEED_WORKERS, 5000.0, MIN_SPEED_MBPS)
+    fast = await _run_speed_tests(candidates)
+    fast.sort(key=lambda c: c.speed_mbps, reverse=True)
+    log.info('  passed: %d  (%.1fs)', len(fast), time.monotonic() - t0)
 
-    tls_sem = asyncio.Semaphore(MAX_TLS_CONC)
-    await asyncio.gather(*[_tls_probe(c, tls_sem) for c in tls_candidates])
+    final = fast[:TARGET_COUNT]
+    # Backfill if speed test returned fewer than TARGET_COUNT
+    if len(final) < TARGET_COUNT:
+        tested_keys = {c.key() for c in candidates}
+        extras = [c for c in alive[SPEED_TEST_TOP:] if c.key() not in tested_keys]
+        need = TARGET_COUNT - len(final)
+        final += extras[:need]
+        if need: log.info('  backfilled %d from non-speed-tested alive pool', need)
 
-    tls_ok  = sum(1 for c in tls_candidates if c.tls_ms is not None)
-    tls_bad = len(tls_candidates) - tls_ok
-    log.info('  TLS ok: %d  failed: %d  (%.1fs)',
-             tls_ok, tls_bad, time.monotonic() - t_start)
-
-    # ── 5. Final sort + slice ─────────────────────────────────────────────────
-    alive.sort(key=lambda c: c.score, reverse=True)
-    final = alive[:TARGET_COUNT]
-
-    # ── 6. Build output ───────────────────────────────────────────────────────
     ts = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())
     lines = [
-        '#profile-title: Relay 100',
+        '#profile-title: Relay',
         '#profile-update-interval: 1',
-        f'#announce: ⚡️ Relay {len(final)} configs | {ts} ⚡️',
+        f'#announce: ⚡️ Relay {len(final)} | {ts} ⚡️',
         '#profile-web-page-url: https://github.com/jasonevm/relay',
         '',
     ]
     for i, cfg in enumerate(final):
-        flag, ctry = _country(cfg.host)
-        sec    = cfg.security.upper() or '—'
-        sni    = cfg.sni or '—'
-        tcp    = f'{cfg.tcp_ms:.0f}ms' if cfg.tcp_ms else '?'
-        tls    = f'TLS:{cfg.tls_ms:.0f}ms' if cfg.tls_ms else ''
-        timing = f'{tcp} {tls}'.strip()
-        name   = f'{flag} {ctry} | {cfg.protocol.upper()} | {sec} | {sni} | {timing} | #{i+1}'
-        lines.append(f'{cfg.raw}#{name}')
-
+        lines.append(f'{cfg.raw}#{cfg.label(i)}')
     with open('configs.txt', 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
 
-    # ── 7. Stats ──────────────────────────────────────────────────────────────
-    elapsed = time.monotonic() - t_start
-    by_proto = {}; by_sec = {}; by_ctry = {}
+    by_proto = {}; by_sec = {}; by_ctry = {}; speeds = []
     for c in final:
-        by_proto[c.protocol]       = by_proto.get(c.protocol, 0) + 1
-        by_sec[c.security or '—']  = by_sec.get(c.security or '—', 0) + 1
-        _, ctry = _country(c.host)
-        by_ctry[ctry]              = by_ctry.get(ctry, 0) + 1
+        by_proto[c.protocol]      = by_proto.get(c.protocol, 0) + 1
+        by_sec[c.security or '—'] = by_sec.get(c.security or '—', 0) + 1
+        _, ctry = _country(c.host); by_ctry[ctry] = by_ctry.get(ctry, 0) + 1
+        if c.speed_mbps: speeds.append(c.speed_mbps)
 
-    log.info('─' * 52)
-    log.info('Saved configs.txt  (%d configs)', len(final))
+    log.info('─' * 54)
+    log.info('configs.txt  (%d configs)', len(final))
     log.info('Protocol : %s', by_proto)
     log.info('Security : %s', by_sec)
     log.info('Countries: %s', sorted(by_ctry.items(), key=lambda x: -x[1])[:5])
-    log.info('Total elapsed: %.1fs', elapsed)
+    if speeds:
+        log.info('Speed    : min=%.0f avg=%.0f max=%.0f Mbps',
+                 min(speeds), sum(speeds)/len(speeds), max(speeds))
+    log.info('Total    : %.1fs', time.monotonic() - t0)
 
 if __name__ == '__main__':
     asyncio.run(main())
